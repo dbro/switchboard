@@ -11,8 +11,8 @@
  *   recv: {"type":"reply","replyTo":"n","payload":"..."} or {"type":"error","message":"..."}
  *
  * Subscriber receives forwarded publishes and sends replies:
- *   recv: {"type":"publish",...}
- *   send: {"type":"reply","replyTo":"n","payload":"..."}
+ *   recv: {"type":"publish",...}  (broadcast to ALL subscribers on the channel)
+ *   send: {"type":"reply","replyTo":"n","payload":"..."}  (any/all subscribers may reply)
  *
  * HTTP (non-upgraded):
  *   GET  /status → 200 "ok"
@@ -127,6 +127,8 @@ typedef struct {
     /* CONN_PUBLISHER */
     char     channel[128];      /* channel this publish is for             */
     char     reply_to[128];     /* replyTo, for routing reply              */
+    /* common */
+    char     origin[256];       /* Origin header from WebSocket handshake  */
 } Conn;
 
 static Conn *conns;  /* allocated in main() */
@@ -153,15 +155,6 @@ static void conn_free(Conn *c) {
     close(c->fd);
     free(c->rbuf);
     memset(c, 0, sizeof(*c));
-}
-
-static Conn *find_subscriber(const char *channel) {
-    for (int i = 0; i < cfg_conns; i++) {
-        if (conns[i].type != CONN_SUBSCRIBER) continue;
-        for (int j = 0; j < conns[i].nchannels; j++)
-            if (strcmp(conns[i].channels[j], channel) == 0) return &conns[i];
-    }
-    return NULL;
 }
 
 static Conn *find_publisher(const char *reply_to) {
@@ -254,6 +247,40 @@ static void ws_error(int fd, const char *msg) {
     ws_send(fd, buf, (size_t)n);
 }
 
+static void inject_origin(const char *payload, size_t plen, const char *origin,
+                          char **out, size_t *outlen) {
+    /* Append at end so switchboard's value wins over any sender-supplied "origin". */
+    char suffix[300];
+    int sfxlen = snprintf(suffix, sizeof(suffix), ",\"_switchboard_origin\":\"%s\"}", origin);
+    *outlen = plen - 1 + (size_t)sfxlen;  /* drop payload's closing '}', add suffix */
+    *out = (char *)malloc(*outlen + 1);
+    if (!*out) { *outlen = 0; return; }
+    memcpy(*out, payload, plen - 1);
+    memcpy(*out + plen - 1, suffix, sfxlen);
+    (*out)[*outlen] = '\0';
+}
+
+static int send_to_subscribers(const char *channel, const char *payload, size_t plen,
+                                const char *origin) {
+    char *msg = NULL; size_t mlen = 0;
+    if (plen >= 2 && payload[0] == '{')
+        inject_origin(payload, plen, origin, &msg, &mlen);
+
+    int count = 0;
+    for (int i = 0; i < cfg_conns; i++) {
+        if (conns[i].type != CONN_SUBSCRIBER) continue;
+        for (int j = 0; j < conns[i].nchannels; j++) {
+            if (strcmp(conns[i].channels[j], channel) == 0) {
+                ws_send(conns[i].fd, msg ? msg : payload, msg ? mlen : plen);
+                count++;
+                break;
+            }
+        }
+    }
+    free(msg);
+    return count;
+}
+
 /* ── WebSocket message dispatch ──────────────────────────────────────────── */
 
 static void ws_dispatch(Conn *c, char *payload, size_t plen) {
@@ -293,9 +320,8 @@ static void ws_dispatch(Conn *c, char *payload, size_t plen) {
         c->type = CONN_PUBLISHER;
         snprintf(c->channel,  sizeof(c->channel),  "%s", channel);
         snprintf(c->reply_to, sizeof(c->reply_to), "%s", reply_to);
-        Conn *sub = find_subscriber(channel);
-        if (!sub) { ws_error(c->fd, "No subscriber for that channel"); return; }
-        ws_send(sub->fd, payload, plen);
+        if (!send_to_subscribers(channel, payload, plen, c->origin))
+            ws_error(c->fd, "No subscriber for that channel");
         return;
     }
 
@@ -304,7 +330,16 @@ static void ws_dispatch(Conn *c, char *payload, size_t plen) {
         char reply_to[128]={0};
         if (!json_str(payload,"replyTo",reply_to,sizeof(reply_to))) return;
         Conn *pub = find_publisher(reply_to);
-        if (pub) ws_send(pub->fd, payload, plen);
+        if (pub) {
+            if (plen >= 2 && payload[0] == '{') {
+                char *msg = NULL; size_t mlen = 0;
+                inject_origin(payload, plen, c->origin, &msg, &mlen);
+                ws_send(pub->fd, msg ? msg : payload, msg ? mlen : plen);
+                free(msg);
+            } else {
+                ws_send(pub->fd, payload, plen);
+            }
+        }
         return;
     }
 }
@@ -361,6 +396,19 @@ static void handle_http(Conn *c) {
 
     if (strcmp(method,"GET")==0 && strcmp(path,"/ws")==0 &&
         (strstr(c->rbuf,"Upgrade: websocket")||strstr(c->rbuf,"upgrade: websocket"))) {
+        const char *op = strstr(c->rbuf, "Origin:");
+        if (!op) op = strstr(c->rbuf, "origin:");
+        if (op) {
+            op += 7;
+            while (*op == ' ') op++;
+            const char *oe = op;
+            while (*oe && *oe != '\r' && *oe != '\n') oe++;
+            int olen = (int)(oe - op);
+            if (olen > 0 && olen < (int)sizeof(c->origin)) {
+                memcpy(c->origin, op, olen);
+                c->origin[olen] = '\0';
+            }
+        }
         if (ws_upgrade(c->fd, c->rbuf) == 0) { c->type=CONN_WS; c->rlen=0; }
         else { http_respond(c->fd,400,"Bad Request",NULL,0); conn_free(c); }
         return;
